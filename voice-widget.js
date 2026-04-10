@@ -1,21 +1,4 @@
-/**
- * =================================================================
- * VOICE AI ASSISTANT SDK - Embeddable Widget
- * =================================================================
- * Production-grade, framework-agnostic JavaScript SDK
- * 
- * USAGE:
- * <script>
- *   window.VOICE_AI_CONFIG = {
- *     clientId: "ca_firm_1",
- *     apiUrl: "https://yourdomain.com/api/voice-agent",
- *     position: "bottom-right",
- *     theme: "light"
- *   };
- * </script>
- * <script src="https://cdn.com/voice-widget.js"></script>
- * =================================================================
- */
+
 
 (function () {
   'use strict';
@@ -25,13 +8,16 @@
     clientId: 'default_client',
     apiUrl: 'http://localhost:3000/api/voice-agent',
     position: 'bottom-right',
-    theme: 'light',
+    theme: 'auto',  // 'light' | 'dark' | 'auto'
     autoStart: false,
     language: 'en-IN',
     voiceRate: 1.18,
     voicePitch: 1.03,
     voiceVolume: 1,
     preferredVoiceNames: ['Google UK English Female', 'Microsoft Neerja Online (Natural) - English (India)', 'Microsoft Aria Online (Natural) - English (United States)'],
+    assistantName: 'Voice Assistant',
+    assistantSubtitle: 'AI Concierge',
+    greeting: '',
     debug: false
   };
 
@@ -52,7 +38,42 @@
   class VoiceAIWidget {
     constructor(config = {}) {
       this.config = { ...DEFAULT_CONFIG, ...(window.VOICE_AI_CONFIG || {}), ...config };
+
+      this.originalThemeConfig = this.config.theme;
+      // Resolve theme
+      if (this.config.theme === 'auto') {
+        const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+        this.config.theme = mediaQuery.matches ? 'dark' : 'light';
+        
+        // 4.5 - Auto-toggle when OS changes
+        mediaQuery.addEventListener('change', e => {
+          if (this.originalThemeConfig === 'auto') {
+            this.config.theme = e.matches ? 'dark' : 'light';
+            if (this.container) {
+              this.container.className = `voice-widget theme-${this.config.theme} position-${this.config.position}`;
+            }
+          }
+        });
+      }
+
+      // Detect iOS (needs special TTS handling)
+      this.isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
       
+      // 4.3 - iOS disables autoplay by default to respect browser rules
+      if (this.isIOS && this.config.voiceAutoplay !== false) {
+        this.config.voiceAutoplay = false;
+      } else if (this.config.voiceAutoplay === undefined) {
+        this.config.voiceAutoplay = true;
+      }
+      // Text-only mode flag (set when voice not supported)
+      this.voiceOnlyFailed = false;
+      // Whether we already showed the greeting
+      this.greetingShown = false;
+      // Whether server config has been loaded
+      this.serverConfigLoaded = false;
+      // Server config cache
+      this.serverConfig = null;
+
       // State management
       this.state = STATES.IDLE;
       this.conversationHistory = [];
@@ -63,12 +84,12 @@
       this.lastInputSource = 'voice';
       this.composerOpen = false;
       this.session_id = this.generateSessionId();
-      
+
       // Browser APIs
       this.recognition = null;
       this.synthesis = window.speechSynthesis;
       this.currentUtterance = null;
-      
+
       // DOM elements
       this.container = null;
       this.button = null;
@@ -84,35 +105,45 @@
       this.currentBookingState = null;
       this.activeFieldHint = null;
       this.lastHandoffKey = null;
-      
+
       // Debounce helpers
       this.apiCallTimeout = null;
-      
+
       this.init();
     }
 
     // ==================== Initialization ====================
     init() {
       this.log('Initializing Voice AI Widget...');
-      
-      // Check browser support
-      if (!this.checkBrowserSupport()) {
-        this.log('Browser does not support required APIs', 'error');
-        return;
+
+      const voiceSupported = this.checkBrowserSupport();
+
+      if (!voiceSupported) {
+        this.log('Voice APIs not supported — switching to text-only mode', 'warn');
+        this.voiceOnlyFailed = true;
+      } else {
+        this.setupSpeechRecognition();
       }
-      
-      // Setup speech recognition
-      this.setupSpeechRecognition();
-      
+
       // Inject styles
       this.injectStyles();
-      
+
       // Create UI
       this.createUI();
-      
+
       // Bind events
       this.bindEvents();
-      
+
+      // Fetch server config (async, non-blocking — updates UI when done)
+      this.fetchServerConfig().then(() => {
+        this._applyServerConfig();
+      });
+
+      // Text-only fallback setup
+      if (this.voiceOnlyFailed) {
+        this.initTextOnlyMode();
+      }
+
       this.log('Voice AI Widget initialized successfully');
     }
 
@@ -121,10 +152,11 @@
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       const hasRecognition = !!SpeechRecognition;
       const hasSynthesis = !!window.speechSynthesis;
-      
-      this.log(`Speech Recognition: ${hasRecognition ? 'supported' : 'not supported'}`);
-      this.log(`Speech Synthesis: ${hasSynthesis ? 'supported' : 'not supported'}`);
-      
+
+      this.log(`Speech Recognition: ${hasRecognition ? 'supported' : 'NOT supported'}`);
+      this.log(`Speech Synthesis: ${hasSynthesis ? 'supported' : 'NOT supported'}`);
+
+      // Both must be available for full voice mode
       return hasRecognition && hasSynthesis;
     }
 
@@ -189,6 +221,8 @@
           errorMsg += 'Network error. Check your connection.';
         } else if (event.error === 'not-allowed') {
           errorMsg += 'Microphone permission denied.';
+          this.voiceOnlyFailed = true; // 4.4 - Hard degrade to text-only mode
+          this.initTextOnlyMode();
         }
         
         this.addSystemMessage(errorMsg);
@@ -238,19 +272,22 @@
       const panelSurface = document.createElement('div');
       panelSurface.className = 'panel-surface';
       
-      // Create panel header
+      // Create panel header — use dynamic names from config
       const header = document.createElement('div');
       header.className = 'panel-header';
+      const assistantName = this.config.assistantName || 'Voice Assistant';
+      const assistantSubtitle = this.config.assistantSubtitle || (this.voiceOnlyFailed ? 'Text Concierge' : 'Voice Concierge');
+      const initials = assistantName.split(' ').map(w => w[0]).join('').substring(0, 2).toUpperCase() || 'AI';
       header.innerHTML = `
         <div class="panel-title-wrap">
           <div class="spark-icon" aria-hidden="true">✦</div>
           <div class="panel-title">
-            <span class="assistant-name">Luminous Agent</span>
-            <span class="assistant-subtitle">Voice Concierge</span>
+            <span class="assistant-name" id="voice-assistant-name">${assistantName}</span>
+            <span class="assistant-subtitle" id="voice-assistant-subtitle">${assistantSubtitle}</span>
           </div>
         </div>
         <div class="brand-pill" aria-label="Callora AI">
-          <span class="brand-mark">CA</span>
+          <span class="brand-mark" id="voice-brand-mark">${initials}</span>
           <span class="brand-name">Callora AI</span>
         </div>
       `;
@@ -259,11 +296,13 @@
       this.transcript = document.createElement('div');
       this.transcript.id = 'voice-transcript';
       this.transcript.className = 'transcript';
+      this.transcript.setAttribute('aria-live', 'polite');
       
       // Create status indicator
       this.statusIndicator = document.createElement('div');
       this.statusIndicator.className = 'status-indicator';
       this.statusIndicator.textContent = 'Ready';
+      this.statusIndicator.setAttribute('aria-live', 'polite');
       
       // Create controls area
       const controls = document.createElement('div');
@@ -328,12 +367,32 @@
       this.panel.appendChild(panelOrbLayer);
       this.panel.appendChild(panelSurface);
       
+      // Create tooltip
+      this.tooltip = document.createElement('div');
+      this.tooltip.className = 'voice-widget-tooltip';
+      this.tooltip.innerHTML = `
+        <div class="tooltip-content">
+          <div class="tooltip-avatar">
+            <div class="tooltip-orb"></div>
+          </div>
+          <div class="tooltip-text-wrap">
+            <span class="tooltip-greeting">Hi there ✨</span>
+            <span class="tooltip-text">Need help? Talk to me!</span>
+          </div>
+          <button class="tooltip-close" aria-label="Dismiss" type="button">✕</button>
+        </div>
+      `;
+      
       // Assemble container
+      this.container.appendChild(this.tooltip);
       this.container.appendChild(this.button);
       this.container.appendChild(this.panel);
       
       // Mount to DOM
       document.body.appendChild(this.container);
+
+      // Track the orb for reactivity
+      this.orbPrimary = this.panel.querySelector('.orb-primary');
       
       this.log('UI created');
     }
@@ -342,6 +401,23 @@
     bindEvents() {
       // Button toggle
       this.button.addEventListener('click', () => this.togglePanel());
+      
+      // Tooltip events
+      if (this.tooltip) {
+        this.tooltip.addEventListener('click', (e) => {
+          if (!e.target.closest('.tooltip-close')) {
+            this.togglePanel();
+          }
+        });
+        
+        const closeTooltipBtn = this.tooltip.querySelector('.tooltip-close');
+        if (closeTooltipBtn) {
+          closeTooltipBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.tooltip.classList.add('hidden');
+          });
+        }
+      }
       
       // Close button
       this.panel.querySelector('.close-btn').addEventListener('click', () => this.togglePanel());
@@ -416,6 +492,15 @@
       
       this.statusIndicator.textContent = statusMap[newState] || 'Ready';
       this.statusIndicator.className = `status-indicator status-${newState}`;
+
+      // Orb animation
+      if (this.orbPrimary) {
+        if (newState === STATES.LISTENING) {
+          this.orbPrimary.classList.add('listening');
+        } else {
+          this.orbPrimary.classList.remove('listening');
+        }
+      }
     }
 
     updateUIState() {
@@ -425,6 +510,12 @@
         listenBtn.innerHTML = `<span class="btn-icon">${icon}</span><span class="btn-label">${label}</span>`;
         listenBtn.disabled = disabled;
       };
+      
+      if (this.voiceOnlyFailed) {
+        applyListenButton('🚫', 'Disabled', true);
+        listenBtn.title = 'Microphone access is blocked or unavailable in your browser.';
+        return;
+      }
       
       switch (this.state) {
         case STATES.IDLE:
@@ -447,10 +538,21 @@
     togglePanel() {
       this.panel.classList.toggle('hidden');
       this.button.classList.toggle('active');
-      
-      // Focus on open
+
+      // Hide tooltip when panel is toggled
+      if (this.tooltip && !this.panel.classList.contains('hidden')) {
+        this.tooltip.classList.add('hidden');
+      }
+
+      // On open
       if (!this.panel.classList.contains('hidden')) {
         this.transcript.scrollTop = this.transcript.scrollHeight;
+        // Show greeting on first open (GAP-19)
+        setTimeout(() => this.showGreetingOnOpen(), 350);
+      } else {
+        // Panel closed — stop listening / speaking
+        if (this.isListening) this.stopListening();
+        if (this.isSpeaking) this.synthesis.cancel();
       }
     }
 
@@ -618,6 +720,8 @@
       
       // Process with API
       this.setState(STATES.PROCESSING);
+      // Show typing indicator while waiting (GAP-18)
+      this.showTypingIndicator();
       this.sendToBackend(message, source, metadata);
     }
 
@@ -661,14 +765,18 @@
             this.handleBackendResponse(data);
           })
           .catch(err => {
+            this.removeTypingIndicator();
             this.log(`Backend error: ${err.message}`, 'error');
-            this.addSystemMessage('Could not reach server. Please try again.');
+            this.addSystemMessage('Could not reach server. Please check your connection and try again.');
             this.setState(STATES.IDLE);
           });
       }, DEBOUNCE_DELAY_API);
     }
 
     handleBackendResponse(data) {
+      // Remove typing indicator (GAP-18)
+      this.removeTypingIndicator();
+
       const reply = data.reply || 'No response received.';
       const state = data.state || data.actions?.state || null;
       this.renderReviewCard(state);
@@ -683,19 +791,27 @@
           this.addActionMessage('Continue on WhatsApp', whatsappHandoff.url);
         }
       }
-      
+
       // Add assistant message to history
       this.conversationHistory.push({
         role: 'assistant',
         content: reply,
         timestamp: Date.now()
       });
-      
+
       // Display response
       this.addMessageToTranscript(reply, 'assistant', false);
-      
-      // Speak response
-      this.speakResponse(reply);
+
+      // Speak (guard for text-only / iOS)
+      if (!this.voiceOnlyFailed && this.config.voiceAutoplay) {
+        this.speakResponse(reply);
+      } else if (!this.voiceOnlyFailed && !this.config.voiceAutoplay && this.isIOS && this.lastInputSource === 'voice') {
+        // iOS requires user gesture to speak — show tap button
+        this.showTapToSpeakButton(reply);
+      } else {
+        // Text-only mode — just go back to idle
+        this.setState(STATES.IDLE);
+      }
     }
 
     updateBookingControls(state) {
@@ -707,6 +823,11 @@
 
     // ==================== Text-to-Speech ====================
     speakResponse(text) {
+      // Guard: never call synthesis in text-only mode
+      if (this.voiceOnlyFailed || !this.synthesis) {
+        this.setState(STATES.IDLE);
+        return;
+      }
       // Cancel any existing speech
       this.synthesis.cancel();
       
@@ -858,13 +979,185 @@
     log(message, level = 'info') {
       if (this.config.debug) {
         const prefix = `[VoiceAI] ${level.toUpperCase()}`;
-        if (level === 'error') {
-          console.error(prefix, message);
-        } else if (level === 'warn') {
-          console.warn(prefix, message);
-        } else {
-          console.log(prefix, message);
+        if (level === 'error') console.error(prefix, message);
+        else if (level === 'warn') console.warn(prefix, message);
+        else console.log(prefix, message);
+      }
+    }
+
+    // ==================== Server Config Fetch (GAP-17) ====================
+    async fetchServerConfig() {
+      try {
+        const cacheKey = `voice_cfg_${this.config.clientId}`;
+        const cached = sessionStorage.getItem(cacheKey); // sessionStorage = per-tab, auto-clears
+        if (cached) {
+          const { data, ts } = JSON.parse(cached);
+          if (Date.now() - ts < 3600000) { // 1 hour TTL
+            this.serverConfig = data;
+            return;
+          }
         }
+        const baseUrl = this.config.apiUrl.replace('/api/voice-agent', '');
+        const resp = await fetch(`${baseUrl}/api/configs/${encodeURIComponent(this.config.clientId)}`);
+        if (resp.ok) {
+          const data = await resp.json();
+          this.serverConfig = data;
+          sessionStorage.setItem(cacheKey, JSON.stringify({ data, ts: Date.now() }));
+          this.log('Server config loaded');
+        }
+      } catch (e) {
+        this.log(`Server config fetch failed (non-fatal): ${e.message}`, 'warn');
+      }
+    }
+
+    _applyServerConfig() {
+      const cfg = this.serverConfig;
+      if (!cfg) return;
+
+      // Update assistant name in header
+      const name = cfg.assistant?.name;
+      const nameEl = document.getElementById('voice-assistant-name');
+      if (name && nameEl) {
+        nameEl.textContent = name;
+        this.config.assistantName = name;
+        // Update brand mark initials
+        const markEl = document.getElementById('voice-brand-mark');
+        if (markEl) markEl.textContent = name.split(' ').map(w => w[0]).join('').substring(0, 2).toUpperCase();
+      }
+
+      // Apply theme colors from server config
+      const primary = cfg.ui?.color_scheme?.primary;
+      const secondary = cfg.ui?.color_scheme?.secondary;
+      const accent = cfg.ui?.color_scheme?.accent;
+      const widget = document.getElementById('voice-ai-widget');
+      if (widget) {
+        if (primary) widget.style.setProperty('--callora-primary', primary);
+        if (secondary) widget.style.setProperty('--callora-secondary', secondary);
+        if (accent) widget.style.setProperty('--callora-accent', accent);
+      }
+
+      // Cache greeting for use when panel opens
+      if (cfg.conversation?.greeting) {
+        this.config.greeting = cfg.conversation.greeting;
+      }
+
+      this.serverConfigLoaded = true;
+
+      // Trigger scroll-based engagement once config applies
+      if (this.config.autoStart || cfg.features?.enable_proactive_greeting) {
+        this.setupProactiveEngagement();
+      }
+    }
+
+    // ==================== Typing Indicator (GAP-18) ====================
+    showTypingIndicator() {
+      this.removeTypingIndicator(); // remove if already exists
+      const el = document.createElement('div');
+      el.id = 'voice-typing-indicator';
+      el.className = 'message message-assistant';
+      el.setAttribute('aria-label', 'Assistant is typing');
+      el.innerHTML = '<div class="message-content typing-indicator-dots"><span></span><span></span><span></span></div>';
+      this.transcript.appendChild(el);
+      this.transcript.scrollTop = this.transcript.scrollHeight;
+    }
+
+    removeTypingIndicator() {
+      const el = document.getElementById('voice-typing-indicator');
+      if (el) el.remove();
+    }
+
+    // ==================== Text-Only Fallback (GAP-05) ====================
+    initTextOnlyMode() {
+      this.log('Initializing text-only mode');
+      // Auto-open composer
+      if (this.composer) {
+        this.composer.classList.remove('hidden');
+        this.composerOpen = true;
+      }
+      // Visually disable the listen button gracefully
+      const listenBtn = this.panel.querySelector('.listen-btn');
+      if (listenBtn) {
+        listenBtn.innerHTML = `<span class="btn-icon">🚫</span><span class="btn-label">Disabled</span>`;
+        listenBtn.disabled = true;
+        listenBtn.title = 'Microphone access is blocked or unavailable in your browser.';
+      }
+      // Show info message
+      setTimeout(() => {
+        this.addSystemMessage('Voice input is not supported in this browser. Type your message below — everything else works perfectly!');
+      }, 300);
+    }
+
+    // ==================== iOS Tap-to-Speak Button (GAP-05) ====================
+    showTapToSpeakButton(text) {
+      const el = document.createElement('div');
+      el.className = 'message message-assistant tap-to-speak';
+      el.innerHTML = `
+        <div class="message-content tap-to-speak-content">
+          <span class="tap-to-speak-text">${text}</span>
+          <button class="tap-speak-btn" title="Tap to hear reply">🔊 Tap to hear</button>
+        </div>
+      `;
+      el.querySelector('.tap-speak-btn').addEventListener('click', () => {
+        this.config.voiceAutoplay = true; // Unlock autoplay natively for the rest of the session
+        this.speakResponse(text);
+        el.querySelector('.tap-speak-btn').remove();
+      });
+      this.transcript.appendChild(el);
+      this.transcript.scrollTop = this.transcript.scrollHeight;
+    }
+
+    // ==================== Greeting on Open (GAP-19) ====================
+    showGreetingOnOpen() {
+      if (this.greetingShown || this.conversationHistory.length > 0) return;
+
+      const greeting = this.config.greeting
+        || this.serverConfig?.conversation?.greeting
+        || null;
+
+      if (!greeting) return;
+
+      this.greetingShown = true;
+      this.addMessageToTranscript(greeting, 'assistant', false);
+      if (!this.voiceOnlyFailed && this.config.voiceAutoplay) {
+        this.speakResponse(greeting);
+      } else if (!this.voiceOnlyFailed && !this.config.voiceAutoplay && this.isIOS) {
+        this.showTapToSpeakButton(greeting);
+      }
+    }
+
+    // ==================== Proactive Engagement (GAP-19) ====================
+    setupProactiveEngagement() {
+      // Create intersection observer
+      const observer = new IntersectionObserver((entries) => {
+        if (entries[0].isIntersecting) return; // Top is visible, don't trigger yet
+        
+        // Scrolled down, trigger proactive engagement
+        setTimeout(() => {
+          if (!this.panel.classList.contains('hidden') || this.conversationHistory.length > 0) return; // Already open/used
+          
+          this.togglePanel(); // Open it
+          
+          const fallbackGreeting = "Hi there! I can help you easily find what you're looking for.";
+          const greeting = this.serverConfig?.conversation?.proactive_greeting 
+            || this.config.proactiveGreeting 
+            || fallbackGreeting;
+
+          // Prevent duplication
+          this.greetingShown = true;
+          this.addMessageToTranscript(greeting, 'assistant', false);
+          if (!this.voiceOnlyFailed && this.config.voiceAutoplay) {
+            this.speakResponse(greeting);
+          } else if (!this.voiceOnlyFailed && !this.config.voiceAutoplay && this.isIOS) {
+            this.showTapToSpeakButton(greeting);
+          }
+        }, 1500);
+        observer.disconnect(); // Fire only once
+      }, { threshold: [0] });
+
+      // Observe the body or top header
+      const topTrigger = document.querySelector('header') || document.body;
+      if (topTrigger) {
+        observer.observe(topTrigger);
       }
     }
 
@@ -962,6 +1255,137 @@
   height: 30px;
 }
 
+/* Tooltip */
+.voice-widget-tooltip {
+  position: absolute;
+  bottom: 80px;
+  right: 0;
+  width: max-content;
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  padding: 10px 14px 10px 10px;
+  border-radius: 20px 20px 0 20px;
+  box-shadow: 0 12px 30px rgba(16, 46, 61, 0.15);
+  font-family: inherit;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  opacity: 1;
+  transform: translateY(0);
+  transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation: floatTooltip 3s ease-in-out infinite;
+  z-index: 10;
+  cursor: pointer;
+}
+
+.voice-widget.theme-dark .voice-widget-tooltip {
+  background: rgba(20, 31, 36, 0.85);
+  border-color: rgba(138, 174, 192, 0.22);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4);
+}
+
+.voice-widget.position-bottom-left .voice-widget-tooltip {
+  right: auto;
+  left: 0;
+  border-radius: 20px 20px 20px 0;
+}
+
+.voice-widget-tooltip:hover {
+  transform: translateY(-2px) scale(1.02);
+  animation-play-state: paused;
+}
+
+.voice-widget-tooltip.hidden {
+  opacity: 0;
+  transform: translateY(15px) scale(0.9);
+  pointer-events: none;
+}
+
+.tooltip-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tooltip-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--callora-surface-strong);
+  border: 1px solid var(--callora-outline);
+  display: grid;
+  place-items: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.tooltip-orb {
+  width: 100%;
+  height: 100%;
+  background: radial-gradient(circle at 30% 30%, var(--callora-primary), var(--callora-secondary));
+  border-radius: 50%;
+  animation: pulseOrb 2s alternate infinite ease-in-out;
+}
+
+@keyframes pulseOrb {
+  0% { transform: scale(0.85); filter: brightness(1) blur(2px); }
+  100% { transform: scale(1.1); filter: brightness(1.2) blur(4px); }
+}
+
+.tooltip-text-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tooltip-greeting {
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--callora-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.voice-widget.theme-dark .tooltip-greeting {
+  color: #69d2d6;
+}
+
+.tooltip-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--callora-text);
+  white-space: nowrap;
+}
+
+.tooltip-close {
+  background: none;
+  border: none;
+  color: var(--callora-text-soft);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px;
+  margin-left: 4px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  transition: background 0.2s, color 0.2s;
+}
+
+.tooltip-close:hover {
+  background: rgba(0,0,0,0.05);
+  color: var(--callora-text);
+}
+
+.voice-widget.theme-dark .tooltip-close:hover {
+  background: rgba(255,255,255,0.1);
+}
+
+@keyframes floatTooltip {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
 /* Panel */
 .voice-widget-panel {
   position: absolute;
@@ -1018,6 +1442,15 @@
   top: -48px;
   right: -72px;
   background: radial-gradient(circle at center, rgba(17, 138, 148, 0.58), rgba(17, 100, 163, 0.34));
+}
+
+.orb-primary.listening {
+  animation: orbPulse 0.8s ease-in-out infinite alternate;
+}
+
+@keyframes orbPulse {
+  from { transform: scale(1); filter: blur(44px) brightness(1); }
+  to   { transform: scale(1.18); filter: blur(36px) brightness(1.2); }
 }
 
 .orb-secondary {
@@ -1286,15 +1719,16 @@
 }
 
 .message-preview {
-  justify-content: flex-start;
+  justify-content: flex-end;
   opacity: 0.7;
   font-style: italic;
 }
 
 .message-preview .message-content {
-  background: rgba(255, 255, 255, 0.58);
-  color: #5a6d78;
-  border-radius: 14px 14px 14px 4px;
+  background: linear-gradient(135deg, rgba(15, 138, 143, 0.6), rgba(17, 100, 163, 0.6));
+  color: #f7fdff;
+  border-radius: 16px 16px 4px 16px;
+  box-shadow: 0 4px 12px rgba(17, 100, 163, 0.15);
 }
 
 .message-content {
@@ -1566,7 +2000,6 @@
 
 .voice-widget.theme-dark .status-indicator,
 .voice-widget.theme-dark .message-assistant .message-content,
-.voice-widget.theme-dark .message-preview .message-content,
 .voice-widget.theme-dark .message-system .message-content,
 .voice-widget.theme-dark .control-btn,
 .voice-widget.theme-dark .close-btn,
@@ -1575,7 +2008,6 @@
 }
 
 .voice-widget.theme-dark .message-assistant .message-content,
-.voice-widget.theme-dark .message-preview .message-content,
 .voice-widget.theme-dark .message-system .message-content,
 .voice-widget.theme-dark .status-indicator,
 .voice-widget.theme-dark .control-btn,
@@ -1687,6 +2119,62 @@
 
 .transcript::-webkit-scrollbar-thumb:hover {
   background: rgba(44, 95, 123, 0.55);
+}
+
+/* Typing Indicator */
+.typing-indicator-dots {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 12px 16px !important;
+  min-width: 52px;
+}
+
+.typing-indicator-dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgba(15, 138, 143, 0.55);
+  animation: typingBounce 1.2s infinite ease-in-out;
+  display: block;
+}
+
+.typing-indicator-dots span:nth-child(1) { animation-delay: 0s; }
+.typing-indicator-dots span:nth-child(2) { animation-delay: 0.18s; }
+.typing-indicator-dots span:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes typingBounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-6px); opacity: 1; }
+}
+
+/* Tap-to-Speak (iOS) */
+.tap-to-speak-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tap-speak-btn {
+  align-self: flex-start;
+  border: none;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--callora-primary), var(--callora-secondary));
+  color: white;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+}
+
+.tap-speak-btn:hover {
+  filter: brightness(1.08);
+}
+
+/* Text-only notice */
+.message-system .message-content {
+  font-style: italic;
 }
     `;
   };
