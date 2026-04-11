@@ -1,5 +1,4 @@
 
-
 (function () {
   'use strict';
 
@@ -95,6 +94,7 @@
       this.button = null;
       this.panel = null;
       this.transcript = null;
+      this.messageList = null;
       this.statusIndicator = null;
       this.composer = null;
       this.composerInput = null;
@@ -102,9 +102,14 @@
       this.quickActions = null;
       this.reviewCard = null;
       this.reviewCardFields = null;
+      this.reviewConfirmButton = null;
+      this.fieldAssist = null;
+      this.fieldAssistLabel = null;
+      this.fieldAssistBody = null;
       this.currentBookingState = null;
       this.activeFieldHint = null;
       this.lastHandoffKey = null;
+      this.lastSessionActionKey = null;
 
       // Debounce helpers
       this.apiCallTimeout = null;
@@ -297,6 +302,10 @@
       this.transcript.id = 'voice-transcript';
       this.transcript.className = 'transcript';
       this.transcript.setAttribute('aria-live', 'polite');
+
+      this.messageList = document.createElement('div');
+      this.messageList.className = 'transcript-messages';
+      this.transcript.appendChild(this.messageList);
       
       // Create status indicator
       this.statusIndicator = document.createElement('div');
@@ -353,12 +362,24 @@
         <div class="review-card-fields"></div>
       `;
       this.reviewCardFields = this.reviewCard.querySelector('.review-card-fields');
+      this.reviewConfirmButton = this.reviewCard.querySelector('.review-confirm-btn');
+
+      this.fieldAssist = document.createElement('div');
+      this.fieldAssist.className = 'field-assist hidden';
+      this.fieldAssist.innerHTML = `
+        <div class="field-assist-label"></div>
+        <div class="field-assist-body"></div>
+      `;
+      this.fieldAssistLabel = this.fieldAssist.querySelector('.field-assist-label');
+      this.fieldAssistBody = this.fieldAssist.querySelector('.field-assist-body');
+
+      this.transcript.appendChild(this.reviewCard);
+      this.transcript.appendChild(this.fieldAssist);
       
       // Assemble panel
       panelSurface.appendChild(header);
       panelSurface.appendChild(this.statusIndicator);
       panelSurface.appendChild(this.transcript);
-      panelSurface.appendChild(this.reviewCard);
       panelSurface.appendChild(this.composer);
       panelSurface.appendChild(this.quickActions);
       panelSurface.appendChild(controls);
@@ -444,6 +465,29 @@
         if (event.target.closest('.review-confirm-btn')) {
           this.sendQuickConfirm();
         }
+      });
+
+      this.transcript.addEventListener('wheel', (event) => {
+        if (this.panel.classList.contains('hidden')) return;
+        const canScroll = this.transcript.scrollHeight > this.transcript.clientHeight;
+        if (!canScroll) return;
+        event.preventDefault();
+        this.transcript.scrollTop += event.deltaY;
+      }, { passive: false });
+
+      this.fieldAssist.addEventListener('click', (event) => {
+        const chip = event.target.closest('[data-field-value]');
+        if (!chip) return;
+        const slot = chip.dataset.slot;
+        const value = chip.dataset.fieldValue;
+        if (!slot || !value) return;
+        this.submitStructuredField(slot, value);
+      });
+
+      this.fieldAssist.addEventListener('change', (event) => {
+        const input = event.target.closest('[data-field-input]');
+        if (!input || !input.value) return;
+        this.submitStructuredField(input.dataset.slot, input.value);
       });
 
       // Composer submit
@@ -633,6 +677,7 @@
       this.composerInput.placeholder = placeholderMap[slotName] || 'Type your message or details';
       this.composerToggleButton.classList.add('attention');
       this.quickActions.classList.remove('hidden');
+      this.renderFieldAssist(this.currentBookingState);
 
       if (this.reviewCard && !this.reviewCard.classList.contains('hidden')) {
         const activeField = this.reviewCard.querySelector(`[data-slot="${slotName}"]`);
@@ -656,11 +701,30 @@
 
       this.currentBookingState = state;
       const slots = state.slots || {};
-      const fields = [
-        { slot: 'name', label: 'Full name', value: slots.name || slots.full_name || 'Missing' },
-        { slot: 'phone_number', label: 'Phone number', value: slots.phone_number || slots.phone || 'Missing' },
-        { slot: 'email', label: 'Email address', value: slots.email || 'Missing' }
-      ];
+      const slotOrder = ['name', 'phone_number', 'email', 'service_type', 'preferred_date', 'preferred_time'];
+      const labelMap = {
+        name: 'Full name',
+        phone_number: 'Phone number',
+        email: 'Email address',
+        service_type: 'Service',
+        preferred_date: 'Preferred date',
+        preferred_time: 'Preferred time'
+      };
+      const valueMap = {
+        name: slots.name || slots.full_name,
+        phone_number: slots.phone_number || slots.phone,
+        email: slots.email,
+        service_type: slots.service_type || slots.service_requested,
+        preferred_date: slots.preferred_date,
+        preferred_time: slots.preferred_time
+      };
+      const fields = slotOrder
+        .filter(slot => valueMap[slot] || (state.required_slots || []).includes(slot))
+        .map(slot => ({
+          slot,
+          label: labelMap[slot] || slot,
+          value: valueMap[slot] || 'Missing'
+        }));
 
       this.reviewCardFields.innerHTML = fields.map(field => `
         <button class="review-field" type="button" data-slot="${field.slot}">
@@ -676,7 +740,77 @@
       this.composerInput.placeholder = 'Type a correction or confirm the review';
     }
 
+    renderFieldAssist(state) {
+      const isBookingActive = Boolean(state && (state.stage === 'collecting_slots' || state.stage === 'confirming'));
+      if (!isBookingActive) {
+        this.fieldAssist.classList.add('hidden');
+        this.fieldAssistBody.innerHTML = '';
+        return;
+      }
+
+      const slot = state?.stage === 'collecting_slots'
+        ? (state?.pending_slot || this.activeFieldHint || null)
+        : (this.activeFieldHint || state?.pending_slot || null);
+      if (!slot || !['preferred_date', 'preferred_time'].includes(slot)) {
+        this.fieldAssist.classList.add('hidden');
+        this.fieldAssistBody.innerHTML = '';
+        return;
+      }
+
+      if (slot === 'preferred_date') {
+        const today = new Date();
+        const nextWeek = new Date(today);
+        nextWeek.setDate(today.getDate() + 7);
+        this.fieldAssistLabel.textContent = 'Pick a preferred date';
+        this.fieldAssistBody.innerHTML = `
+          <input class="field-assist-input" type="date" data-field-input="true" data-slot="preferred_date" min="${this.formatDateForInput(today)}" />
+          <div class="field-assist-chips">
+            <button class="field-assist-chip" type="button" data-slot="preferred_date" data-field-value="today">Today</button>
+            <button class="field-assist-chip" type="button" data-slot="preferred_date" data-field-value="tomorrow">Tomorrow</button>
+            <button class="field-assist-chip" type="button" data-slot="preferred_date" data-field-value="${this.formatDateForInput(nextWeek)}">Next week</button>
+          </div>
+        `;
+      } else {
+        this.fieldAssistLabel.textContent = 'Pick a preferred time';
+        this.fieldAssistBody.innerHTML = `
+          <input class="field-assist-input" type="time" data-field-input="true" data-slot="preferred_time" step="900" />
+          <div class="field-assist-chips">
+            <button class="field-assist-chip" type="button" data-slot="preferred_time" data-field-value="morning">Morning</button>
+            <button class="field-assist-chip" type="button" data-slot="preferred_time" data-field-value="afternoon">Afternoon</button>
+            <button class="field-assist-chip" type="button" data-slot="preferred_time" data-field-value="evening">Evening</button>
+          </div>
+        `;
+      }
+
+      this.fieldAssist.classList.remove('hidden');
+    }
+
+    formatDateForInput(date) {
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+
+    submitStructuredField(slot, value) {
+      if (!slot || !value) return;
+      this.activeFieldHint = slot;
+      this.addMessageToTranscript(value, 'user', false);
+      this.handleUserInput(value, 'text', { pending_slot: slot, edit_field: slot });
+      this.activeFieldHint = null;
+      this.toggleComposer(false);
+    }
+
+    setReviewConfirmLoading(isLoading) {
+      if (!this.reviewConfirmButton) return;
+      this.reviewConfirmButton.disabled = isLoading;
+      this.reviewConfirmButton.textContent = isLoading ? 'Confirming...' : 'Confirm';
+    }
+
     sendQuickConfirm() {
+      if (this.isProcessing) return;
+      this.activeFieldHint = null;
+      this.setReviewConfirmLoading(true);
       this.addMessageToTranscript('yes', 'user', false);
       this.handleUserInput('yes', 'text');
     }
@@ -766,6 +900,7 @@
           })
           .catch(err => {
             this.removeTypingIndicator();
+            this.setReviewConfirmLoading(false);
             this.log(`Backend error: ${err.message}`, 'error');
             this.addSystemMessage('Could not reach server. Please check your connection and try again.');
             this.setState(STATES.IDLE);
@@ -779,8 +914,15 @@
 
       const reply = data.reply || 'No response received.';
       const state = data.state || data.actions?.state || null;
+      if (state?.stage === 'collecting_slots') {
+        this.activeFieldHint = state.pending_slot || null;
+      } else if (!state || state.stage !== 'confirming') {
+        this.activeFieldHint = null;
+      }
       this.renderReviewCard(state);
+      this.renderFieldAssist(state);
       this.updateBookingControls(state);
+      this.setReviewConfirmLoading(false);
 
       const whatsappHandoff = data.actions?.whatsapp_handoff || null;
       if (whatsappHandoff && whatsappHandoff.url) {
@@ -789,6 +931,14 @@
         if (this.lastHandoffKey !== handoffKey) {
           this.lastHandoffKey = handoffKey;
           this.addActionMessage('Continue on WhatsApp', whatsappHandoff.url);
+        }
+      }
+
+      if (data.actions?.start_new_chat) {
+        const actionKey = `${data.session_id || this.session_id}:${data.actions?.idle_timeout_minutes || 'timeout'}`;
+        if (this.lastSessionActionKey !== actionKey) {
+          this.lastSessionActionKey = actionKey;
+          this.addSessionControlMessage('Start New Chat', () => this.startNewChatSession());
         }
       }
 
@@ -819,6 +969,7 @@
       this.composerToggleButton.classList.toggle('attention', isDataCollection);
       this.quickActions.classList.toggle('hidden', !isDataCollection && !this.composerOpen);
       this.reviewCard.classList.toggle('hidden', !(state && state.stage === 'confirming'));
+      this.renderFieldAssist(state);
     }
 
     // ==================== Text-to-Speech ====================
@@ -896,7 +1047,7 @@
       contentEl.textContent = message;
       
       messageEl.appendChild(contentEl);
-      this.transcript.appendChild(messageEl);
+      this.messageList.appendChild(messageEl);
       
       // Auto scroll
       setTimeout(() => {
@@ -913,7 +1064,7 @@
       contentEl.textContent = message;
       
       messageEl.appendChild(contentEl);
-      this.transcript.appendChild(messageEl);
+      this.messageList.appendChild(messageEl);
       
       this.transcript.scrollTop = this.transcript.scrollHeight;
     }
@@ -939,14 +1090,14 @@
       contentEl.appendChild(textEl);
       contentEl.appendChild(linkEl);
       messageEl.appendChild(contentEl);
-      this.transcript.appendChild(messageEl);
+      this.messageList.appendChild(messageEl);
 
       this.transcript.scrollTop = this.transcript.scrollHeight;
     }
 
     updateTranscriptPreview(text) {
       // Remove previous preview
-      const preview = this.transcript.querySelector('.message-preview');
+      const preview = this.messageList.querySelector('.message-preview');
       if (preview) preview.remove();
       
       // Add new preview
@@ -958,17 +1109,54 @@
       contentEl.textContent = text;
 
       previewEl.appendChild(contentEl);
-      this.transcript.appendChild(previewEl);
+      this.messageList.appendChild(previewEl);
       
       this.transcript.scrollTop = this.transcript.scrollHeight;
     }
 
     clearChat() {
       this.conversationHistory = [];
-      this.transcript.innerHTML = '';
+      this.currentBookingState = null;
+      this.activeFieldHint = null;
+      this.lastHandoffKey = null;
+      this.lastSessionActionKey = null;
+      this.messageList.innerHTML = '';
+      this.reviewCard.classList.add('hidden');
+      this.fieldAssist.classList.add('hidden');
       this.addSystemMessage('Chat cleared. Ready to listen.');
       this.setState(STATES.IDLE);
       this.toggleComposer(false);
+    }
+
+    startNewChatSession() {
+      this.clearChat();
+      this.session_id = this.generateSessionId();
+      this.greetingShown = false;
+      this.addSystemMessage('Started a new chat. How can I help you today?');
+    }
+
+    addSessionControlMessage(label, onClick) {
+      const messageEl = document.createElement('div');
+      messageEl.className = 'message message-system message-action';
+
+      const contentEl = document.createElement('div');
+      contentEl.className = 'message-content';
+
+      const textEl = document.createElement('div');
+      textEl.className = 'action-text';
+      textEl.textContent = 'Session timed out due to inactivity.';
+
+      const actionBtn = document.createElement('button');
+      actionBtn.className = 'action-button';
+      actionBtn.type = 'button';
+      actionBtn.textContent = label;
+      actionBtn.addEventListener('click', onClick);
+
+      contentEl.appendChild(textEl);
+      contentEl.appendChild(actionBtn);
+      messageEl.appendChild(contentEl);
+      this.messageList.appendChild(messageEl);
+      this.transcript.scrollTop = this.transcript.scrollHeight;
     }
 
     // ==================== Utility Methods ====================
@@ -1057,7 +1245,7 @@
       el.className = 'message message-assistant';
       el.setAttribute('aria-label', 'Assistant is typing');
       el.innerHTML = '<div class="message-content typing-indicator-dots"><span></span><span></span><span></span></div>';
-      this.transcript.appendChild(el);
+      this.messageList.appendChild(el);
       this.transcript.scrollTop = this.transcript.scrollHeight;
     }
 
@@ -1102,7 +1290,7 @@
         this.speakResponse(text);
         el.querySelector('.tap-speak-btn').remove();
       });
-      this.transcript.appendChild(el);
+      this.messageList.appendChild(el);
       this.transcript.scrollTop = this.transcript.scrollHeight;
     }
 
@@ -1630,12 +1818,22 @@
 /* Transcript */
 .transcript {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 14px 16px 10px;
   display: flex;
   flex-direction: column;
   gap: 10px;
   background: transparent;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+.transcript-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .message {
@@ -1716,6 +1914,20 @@
 
 .action-link:hover {
   filter: brightness(1.03);
+}
+
+.action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: none;
+  background: linear-gradient(135deg, var(--callora-primary), var(--callora-secondary));
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .message-preview {
@@ -1846,9 +2058,70 @@
   box-shadow: 0 10px 20px rgba(17, 100, 163, 0.22);
 }
 
+.review-confirm-btn:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
 .review-card-fields {
   display: grid;
   gap: 8px;
+}
+
+.field-assist {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 4px;
+  padding: 14px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(255, 255, 255, 0.82);
+  box-shadow: 0 12px 28px rgba(40, 60, 71, 0.1);
+}
+
+.field-assist.hidden {
+  display: none;
+}
+
+.field-assist-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--callora-primary);
+}
+
+.field-assist-body {
+  display: grid;
+  gap: 10px;
+}
+
+.field-assist-input {
+  width: 100%;
+  min-height: 44px;
+  border-radius: 12px;
+  border: 1px solid rgba(15, 138, 143, 0.18);
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--callora-text);
+  padding: 0 12px;
+  font: inherit;
+}
+
+.field-assist-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.field-assist-chip {
+  border: 1px solid rgba(15, 138, 143, 0.18);
+  background: rgba(244, 247, 247, 0.92);
+  color: var(--callora-text);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .review-field {
@@ -2024,7 +2297,10 @@
 .voice-widget.theme-dark .quick-action-btn,
 .voice-widget.theme-dark .review-card,
 .voice-widget.theme-dark .review-field,
-.voice-widget.theme-dark .message-composer {
+.voice-widget.theme-dark .message-composer,
+.voice-widget.theme-dark .field-assist,
+.voice-widget.theme-dark .field-assist-input,
+.voice-widget.theme-dark .field-assist-chip {
   background: rgba(20, 31, 36, 0.76);
   border-color: rgba(138, 174, 192, 0.22);
   color: var(--callora-text);
